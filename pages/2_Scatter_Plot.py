@@ -1,28 +1,17 @@
 """
 Page 2 — Interactive Scatter Plot
-Choose a Zoobot column for each axis, click to select up to 15 galaxies,
-view their properties and cutouts.
 """
-
-from typing import Optional
 
 import streamlit as st
 import numpy as np
 import pandas as pd
 import plotly.express as px
-import plotly.graph_objects as go
-from pathlib import Path
-import base64
-from common import load_data, get_esasky_url, ZOOBOT_DISPLAY, PHYSICAL_DISPLAY
+from common import (
+    load_data, get_esasky_url, cutout_url, slider_bounds, in_range,
+    ZOOBOT_DISPLAY, PHYSICAL_DISPLAY,
+)
 
 st.set_page_config(layout="wide", page_title="Scatter Explorer")
-
-
-def img_to_base64(path: str) -> Optional[str]:
-    p = Path(path)
-    if not p.exists():
-        return None
-    return f"data:image/jpeg;base64,{base64.b64encode(p.read_bytes()).decode()}"
 
 
 def main():
@@ -35,7 +24,6 @@ def main():
         "Their properties and cutouts will appear below."
     )
 
-    # ── axis selectors ───────────────────────────────────────────────────
     zb_labels = list(ZOOBOT_DISPLAY.keys())
     col1, col2, col3 = st.columns([2, 2, 2])
     with col1:
@@ -49,14 +37,12 @@ def main():
     x_col = ZOOBOT_DISPLAY[x_label]["col"]
     y_col = ZOOBOT_DISPLAY[y_label]["col"]
 
-    # colour column
     if colour_label != "None":
         all_disp = {**PHYSICAL_DISPLAY, **ZOOBOT_DISPLAY}
         c_col = all_disp[colour_label]["col"]
     else:
         c_col = None
 
-    # ── optional physical-property pre-filters ───────────────────────────
     with st.expander("Pre-filter by physical properties", expanded=False):
         mask = np.ones(len(df), dtype=bool)
         fcol1, fcol2, fcol3 = st.columns(3)
@@ -67,10 +53,10 @@ def main():
             col_data = df[col].dropna()
             if len(col_data) == 0:
                 continue
-            cmin, cmax = float(col_data.min()), float(col_data.max())
-            if cmin >= cmax:
+            if col_data.min() >= col_data.max():
                 continue
-            step = spec.get("step", (cmax - cmin) / 100)
+            step = spec.get("step", (col_data.max() - col_data.min()) / 100)
+            cmin, cmax = slider_bounds(col_data, step)
             fmt = spec.get("format", "%.2f")
             target = [fcol1, fcol2, fcol3][i % 3]
             with target:
@@ -80,12 +66,11 @@ def main():
                 )
             slider_untouched = (vmin <= cmin + step * 0.5) and (vmax >= cmax - step * 0.5)
             if not slider_untouched:
-                mask &= (df[col].fillna(-np.inf) >= vmin) & (df[col].fillna(np.inf) <= vmax)
+                mask &= in_range(df[col], vmin, vmax, step)
         plot_df = df[mask].copy()
-    
+
     st.caption(f"{len(plot_df):,} galaxies in plot after pre-filters.")
 
-    # ── build plotly scatter ─────────────────────────────────────────────
     plot_df = plot_df.dropna(subset=[x_col, y_col])
 
     hover_data = {
@@ -117,12 +102,10 @@ def main():
     )
     fig.update_traces(marker=dict(size=5))
 
-    # render with selection events
     selected_event = st.plotly_chart(
         fig, use_container_width=True, on_select="rerun", key="scatter"
     )
 
-    # ── handle selection ─────────────────────────────────────────────────
     selected_indices = []
     if selected_event and selected_event.selection and selected_event.selection.point_indices:
         selected_indices = selected_event.selection.point_indices
@@ -131,14 +114,12 @@ def main():
         st.info("Use the lasso or box-select tool on the plot to select galaxies (max 15).")
         return
 
-    # cap at 15
     if len(selected_indices) > 15:
         st.warning(f"Selected {len(selected_indices)} — showing the first 15.")
         selected_indices = selected_indices[:15]
 
     sel_df = plot_df.iloc[selected_indices]
 
-    # ── display table ────────────────────────────────────────────────────
     st.markdown(f"### Selected galaxies ({len(sel_df)})")
 
     display_cols = [
@@ -146,7 +127,6 @@ def main():
         "phz_median", "phz_pp_median_stellarmass",
         x_col, y_col,
     ]
-    # deduplicate while preserving order
     display_cols = list(dict.fromkeys(display_cols))
     display_cols = [c for c in display_cols if c in sel_df.columns]
 
@@ -173,7 +153,6 @@ def main():
         mime="text/csv",
     )
 
-    # ── display cutouts ──────────────────────────────────────────────────
     st.markdown("### Cutouts")
 
     css = """
@@ -181,7 +160,7 @@ def main():
     .sel-gallery { display:flex; flex-wrap:wrap; justify-content:center; gap:14px; padding:10px 0; }
     .sel-card { text-align:center; width:180px; }
     .sel-card img { width:170px; height:170px; object-fit:cover; border-radius:6px;
-                    border:2px solid #FF4B4B; }
+                    border:2px solid #FF4B4B; background:#111; }
     .sel-card .slbl { font-size:10px; color:#aaa; margin-top:2px;
                       overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
     .sel-card .sbtn { display:inline-block; margin-top:3px; padding:2px 6px;
@@ -194,14 +173,15 @@ def main():
 
     cards = ""
     for _, row in sel_df.iterrows():
-        b64 = img_to_base64(row["jpg_loc_gz_arcsinh_vis_y"])
-        if b64 is None:
+        fname = row.get("jpg_loc_gz_arcsinh_vis_y")
+        if not fname or pd.isna(fname):
             cards += f'<div class="sel-card"><div class="slbl">{row["object_id"]} (no image)</div></div>'
             continue
+        url = cutout_url(fname)
         esasky = get_esasky_url(row["right_ascension"], row["declination"])
         cards += f"""
         <div class="sel-card">
-            <img src="{b64}" alt="{row['object_id']}">
+            <img src="{url}" alt="{row['object_id']}" loading="lazy">
             <div class="slbl" title="{row['object_id']}">{row['object_id']}</div>
             <a class="sbtn" href="{esasky}" target="_blank">{row['right_ascension']:.4f}, {row['declination']:.4f}</a>
         </div>"""
